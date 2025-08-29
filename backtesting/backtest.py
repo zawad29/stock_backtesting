@@ -30,6 +30,7 @@ class Backtest(BaseModel):
     results_dir: str = Field("", repr=False)
     dow_stats: pd.DataFrame = Field(default_factory=pd.DataFrame, repr=False)
     dom_stats: pd.DataFrame = Field(default_factory=pd.DataFrame, repr=False)
+    processed_trade_log: pd.DataFrame = Field(default_factory=pd.DataFrame, repr=False)
 
 
     class Config:
@@ -47,22 +48,24 @@ class Backtest(BaseModel):
 
     def run(self):
         """
-        Runs the backtest using an iterative, event-driven approach.
+        Runs the backtest using an iterative, event-driven approach with standard accounting.
         """
         position = 0  # -1 for short, 0 for flat, 1 for long
         cash = self.initial_capital
-        holdings = 0
-        
+        holdings_value = 0  # Market value of current holdings
+
         for i in range(len(self.data)):
             # --- End of Day Logic ---
-            is_end_of_day = i > 0 and self.data.index[i].date() != self.data.index[i-1].date()
+            is_end_of_day = i > 0 and self.data.index[i].date() != self.data.index[i - 1].date()
             if is_end_of_day and position != 0:
-                close_price = self.data['Close'].iloc[i-1]
-                if position == 1:
+                # Force close position at the last price of the day
+                close_price = self.data['Close'].iloc[i - 1]
+                if position == 1:  # Close long
                     cash += self.shares_per_trade * close_price
-                elif position == -1:
-                    cash += self.shares_per_trade * (2 * self.trade_log[-1]['Entry Price'] - close_price)
-                self.trade_log[-1].update({'Exit Price': close_price, 'Exit Time': self.data.index[i-1]})
+                    self.trade_log[-1].update({'Exit Price': close_price, 'Exit Time': self.data.index[i - 1]})
+                elif position == -1:  # Close short
+                    cash -= self.shares_per_trade * close_price
+                    self.trade_log[-1].update({'Exit Price': close_price, 'Exit Time': self.data.index[i - 1]})
                 position = 0
 
             # --- Trading Logic ---
@@ -70,33 +73,50 @@ class Backtest(BaseModel):
             exit_signal = self.signals['exit_signal'].iloc[i]
             current_price = self.data['Close'].iloc[i]
 
+            # Handle Exits first
             if position != 0 and exit_signal == 2:
-                if position == 1:
+                if position == 1:  # Exit long
                     cash += self.shares_per_trade * current_price
-                elif position == -1:
-                    cash += self.shares_per_trade * (2 * self.trade_log[-1]['Entry Price'] - current_price)
-                self.trade_log[-1].update({'Exit Price': current_price, 'Exit Time': self.data.index[i]})
-                position = 0
+                    self.trade_log[-1].update({'Exit Price': current_price, 'Exit Time': self.data.index[i]})
+                    position = 0
+                elif position == -1:  # Exit short
+                    cash -= self.shares_per_trade * current_price
+                    self.trade_log[-1].update({'Exit Price': current_price, 'Exit Time': self.data.index[i]})
+                    position = 0
             
+            # Handle Entries if flat
             elif position == 0:
-                if signal == 1:
+                if signal == 1:  # Enter long
                     position = 1
                     cash -= self.shares_per_trade * current_price
-                    self.trade_log.append({'Entry Time': self.data.index[i], 'Entry Price': current_price, 'Type': 'Long'})
-                elif signal == -1:
+                    self.trade_log.append(
+                        {'Entry Time': self.data.index[i], 'Entry Price': current_price, 'Type': 'Long'})
+                elif signal == -1:  # Enter short
                     position = -1
-                    self.trade_log.append({'Entry Time': self.data.index[i], 'Entry Price': current_price, 'Type': 'Short'})
+                    cash += self.shares_per_trade * current_price  # Receive cash from selling borrowed shares
+                    self.trade_log.append(
+                        {'Entry Time': self.data.index[i], 'Entry Price': current_price, 'Type': 'Short'})
 
             # --- Update Portfolio Value ---
             if position == 1:
-                holdings = self.shares_per_trade * current_price
+                holdings_value = self.shares_per_trade * current_price
             elif position == -1:
-                entry_price = self.trade_log[-1]['Entry Price']
-                holdings = self.shares_per_trade * (2 * entry_price - current_price)
+                # For a short position, holdings are a liability against the cash received
+                holdings_value = -self.shares_per_trade * current_price
             else:
-                holdings = 0
+                holdings_value = 0
             
-            self.portfolio.loc[self.data.index[i], 'total'] = cash + holdings
+            self.portfolio.loc[self.data.index[i], 'total'] = cash + holdings_value
+
+        # --- Force close any open position at the end of the backtest ---
+        if position != 0:
+            final_price = self.data['Close'].iloc[-1]
+            if position == 1:
+                cash += self.shares_per_trade * final_price
+            elif position == -1:
+                cash -= self.shares_per_trade * final_price
+            self.trade_log[-1].update({'Exit Price': final_price, 'Exit Time': self.data.index[-1]})
+            self.portfolio.loc[self.data.index[-1], 'total'] = cash
 
         self.portfolio['returns'] = self.portfolio['total'].pct_change()
         self._calculate_metrics()
@@ -115,6 +135,8 @@ class Backtest(BaseModel):
         log['PnL'] = np.where(log['Type'] == 'Long', 
                               (log['Exit Price'] - log['Entry Price']) * self.shares_per_trade,
                               (log['Entry Price'] - log['Exit Price']) * self.shares_per_trade)
+        
+        self.processed_trade_log = log.copy()
         
         total_return = (self.portfolio['total'].iloc[-1] / self.initial_capital) - 1
         returns_std = self.portfolio['returns'].std()
@@ -171,9 +193,9 @@ class Backtest(BaseModel):
         self.portfolio.to_csv(portfolio_path)
         
         log_path_info = ""
-        if self.trade_log:
+        if not self.processed_trade_log.empty:
             log_df_path = os.path.join(self.results_dir, 'day_trading_trade_log.csv')
-            pd.DataFrame(self.trade_log).to_csv(log_df_path)
+            self.processed_trade_log.to_csv(log_df_path)
             log_path_info = f" and '{log_df_path}'"
 
         print(f"\nReports saved to '{portfolio_path}'{log_path_info}")
@@ -188,31 +210,60 @@ class Backtest(BaseModel):
             self.dom_stats.to_csv(dom_stats_path)
             print(f"Day of month stats saved to '{dom_stats_path}'")
 
-    # --- Static Plotting Methods ---
-    def _plot_equity_curve_static(self):
-        fig, ax = plt.subplots(figsize=(15, 8), dpi=300)
-        self.portfolio['total'].plot(ax=ax, lw=2., label='Strategy Equity Curve')
-        trade_log_df = pd.DataFrame(self.trade_log).dropna()
-        if not trade_log_df.empty:
+    def _plot_equity_curve(self, show_window: bool = False):
+        fig, ax1 = plt.subplots(figsize=(15, 8), dpi=300)
+        
+        # Plot Equity Curve on Primary Y-axis
+        ax1.plot(self.portfolio.index, self.portfolio['total'], lw=2., color='royalblue', label='Strategy Equity Curve')
+        ax1.set_ylabel('Portfolio Value ($)', color='royalblue')
+        ax1.tick_params(axis='y', labelcolor='royalblue')
+
+        if not self.processed_trade_log.empty:
+            trade_log_df = self.processed_trade_log
+            # Plot trade markers on the equity curve
             long_trades = trade_log_df[trade_log_df['Type'] == 'Long']
             short_trades = trade_log_df[trade_log_df['Type'] == 'Short']
-            ax.plot(long_trades['Entry Time'], self.portfolio.total.loc[long_trades['Entry Time']],
-                     '^', markersize=8, color='lime', label='Long Entry', alpha=0.8)
-            ax.plot(short_trades['Entry Time'], self.portfolio.total.loc[short_trades['Entry Time']],
-                     'v', markersize=8, color='red', label='Short Entry', alpha=0.8)
-            ax.plot(trade_log_df['Exit Time'], self.portfolio.total.loc[trade_log_df['Exit Time']],
-                     'x', markersize=8, color='black', label='Exit', alpha=0.8)
-        ax.set_title('Day Trading Strategy Performance', fontsize=16)
-        ax.set_ylabel('Portfolio Value ($)')
-        ax.legend()
-        metrics_text = '\n'.join([f'{key}: {value}' for key, value in self.metrics.items()])
-        ax.text(0.05, 0.95, metrics_text, transform=ax.transAxes, fontsize=12,
-                 verticalalignment='top', bbox=dict(boxstyle='round,pad=0.5', fc='white', alpha=0.8))
-        fig.tight_layout()
-        fig.savefig(os.path.join(self.results_dir, '1_equity_curve.png'))
-        plt.close(fig)
+            ax1.plot(long_trades['Entry Time'], self.portfolio.total.loc[long_trades['Entry Time']],
+                     '^', markersize=8, color='lime', label='Long Entry', alpha=0.9)
+            ax1.plot(short_trades['Entry Time'], self.portfolio.total.loc[short_trades['Entry Time']],
+                     'v', markersize=8, color='red', label='Short Entry', alpha=0.9)
+            ax1.plot(trade_log_df['Exit Time'], self.portfolio.total.loc[trade_log_df['Exit Time']],
+                     'x', markersize=8, color='black', label='Exit', alpha=0.9)
+        
+        # Create Secondary Y-axis for Daily PnL Bars
+        ax2 = ax1.twinx()
+        
+        # --- CORRECTED Daily PnL Calculation ---
+        if not self.processed_trade_log.empty:
+            log_df = self.processed_trade_log
+            daily_pnl = log_df.groupby(log_df['Exit Time'].dt.date)['PnL'].sum()
+            daily_pnl.index = pd.to_datetime(daily_pnl.index)
+            
+            colors = ['limegreen' if pnl > 0 else 'salmon' for pnl in daily_pnl]
+            ax2.bar(daily_pnl.index, daily_pnl.values, color=colors, width=0.8, alpha=0.6, label='Daily PnL')
 
-    def _plot_drawdown_static(self):
+        ax2.set_ylabel('Daily PnL ($)', color='dimgray')
+        ax2.tick_params(axis='y', labelcolor='dimgray')
+        ax2.axhline(0, color='grey', lw=0.5, linestyle='--')
+
+        # Final Touches - Combine Legends
+        ax1.set_title('Day Trading Strategy Performance with Daily PnL', fontsize=16)
+        h1, l1 = ax1.get_legend_handles_labels()
+        h2, l2 = ax2.get_legend_handles_labels()
+        ax1.legend(h1 + h2, l1 + l2, loc='upper right')
+
+        metrics_text = '\n'.join([f'{key}: {value}' for key, value in self.metrics.items()])
+        ax1.text(0.02, 0.98, metrics_text, transform=ax1.transAxes, fontsize=10,
+                 verticalalignment='top', bbox=dict(boxstyle='round,pad=0.5', fc='white', alpha=0.8))
+        
+        fig.tight_layout()
+        if show_window:
+            plt.show()
+        else:
+            fig.savefig(os.path.join(self.results_dir, '1_equity_curve_with_daily_pnl.png'))
+            plt.close(fig)
+
+    def _plot_drawdown(self, show_window: bool = False):
         fig, ax = plt.subplots(figsize=(15, 5), dpi=300)
         wealth_index = self.initial_capital * (1 + self.portfolio['returns'].fillna(0)).cumprod()
         previous_peaks = wealth_index.cummax()
@@ -221,10 +272,13 @@ class Backtest(BaseModel):
         ax.set_ylabel('Drawdown (%)')
         ax.set_title('Portfolio Drawdown', fontsize=16)
         fig.tight_layout()
-        fig.savefig(os.path.join(self.results_dir, '2_drawdown.png'))
-        plt.close(fig)
+        if show_window:
+            plt.show()
+        else:
+            fig.savefig(os.path.join(self.results_dir, '2_drawdown.png'))
+            plt.close(fig)
 
-    def _plot_dow_stats_static(self):
+    def _plot_dow_stats(self, show_window: bool = False):
         if not self.dow_stats.empty:
             fig, ax = plt.subplots(figsize=(10, 6), dpi=300)
             self.dow_stats['Total PnL'].plot(kind='bar', ax=ax, color='royalblue', alpha=0.7)
@@ -235,10 +289,13 @@ class Backtest(BaseModel):
             axb.set_ylabel('Win Rate (%)')
             axb.set_ylim(0, 100)
             fig.tight_layout()
-            fig.savefig(os.path.join(self.results_dir, '3_day_of_week_stats.png'))
-            plt.close(fig)
+            if show_window:
+                plt.show()
+            else:
+                fig.savefig(os.path.join(self.results_dir, '3_day_of_week_stats.png'))
+                plt.close(fig)
 
-    def _plot_dom_stats_static(self):
+    def _plot_dom_stats(self, show_window: bool = False):
         if not self.dom_stats.empty:
             fig, ax = plt.subplots(figsize=(15, 6), dpi=300)
             self.dom_stats['Total PnL'].plot(kind='bar', ax=ax, color='seagreen', alpha=0.7)
@@ -250,29 +307,46 @@ class Backtest(BaseModel):
             axb.set_ylabel('Win Rate (%)')
             axb.set_ylim(0, 100)
             fig.tight_layout()
-            fig.savefig(os.path.join(self.results_dir, '4_day_of_month_stats.png'))
-            plt.close(fig)
+            if show_window:
+                plt.show()
+            else:
+                fig.savefig(os.path.join(self.results_dir, '4_day_of_month_stats.png'))
+                plt.close(fig)
 
     # --- Interactive Plotting Methods ---
     def _plot_equity_curve_interactive(self):
-        fig = go.Figure()
-        fig.add_trace(go.Scatter(x=self.portfolio.index, y=self.portfolio['total'], mode='lines', name='Equity Curve'))
+        fig = make_subplots(specs=[[{"secondary_y": True}]])
         
-        trade_log_df = pd.DataFrame(self.trade_log).dropna()
-        if not trade_log_df.empty:
+        # Add Equity Curve
+        fig.add_trace(go.Scatter(x=self.portfolio.index, y=self.portfolio['total'], mode='lines', name='Equity Curve'), secondary_y=False)
+        
+        if not self.processed_trade_log.empty:
+            trade_log_df = self.processed_trade_log
+            # Add Trade Markers
             long_trades = trade_log_df[trade_log_df['Type'] == 'Long']
             short_trades = trade_log_df[trade_log_df['Type'] == 'Short']
-            
             fig.add_trace(go.Scatter(x=long_trades['Entry Time'], y=self.portfolio.total.loc[long_trades['Entry Time']],
-                                     mode='markers', marker_symbol='triangle-up', marker_color='lime', marker_size=10, name='Long Entry'))
+                                     mode='markers', marker_symbol='triangle-up', marker_color='lime', marker_size=10, name='Long Entry'), secondary_y=False)
             fig.add_trace(go.Scatter(x=short_trades['Entry Time'], y=self.portfolio.total.loc[short_trades['Entry Time']],
-                                     mode='markers', marker_symbol='triangle-down', marker_color='red', marker_size=10, name='Short Entry'))
+                                     mode='markers', marker_symbol='triangle-down', marker_color='red', marker_size=10, name='Short Entry'), secondary_y=False)
             fig.add_trace(go.Scatter(x=trade_log_df['Exit Time'], y=self.portfolio.total.loc[trade_log_df['Exit Time']],
-                                     mode='markers', marker_symbol='x', marker_color='black', marker_size=8, name='Exit'))
+                                     mode='markers', marker_symbol='x', marker_color='black', marker_size=8, name='Exit'), secondary_y=False)
+            
+        # Add Daily PnL Bars (Corrected Logic)
+        if not self.processed_trade_log.empty:
+            log_df = self.processed_trade_log
+            daily_pnl = log_df.groupby(log_df['Exit Time'].dt.date)['PnL'].sum()
+            daily_pnl.index = pd.to_datetime(daily_pnl.index)
+
+            colors = np.where(daily_pnl > 0, 'limegreen', 'salmon')
+            fig.add_trace(go.Bar(x=daily_pnl.index, y=daily_pnl.values, name='Daily PnL', marker_color=colors, opacity=0.6), secondary_y=True)
+
+        # Update Layout
+        fig.update_layout(title_text='Interactive Equity Curve with Daily PnL', xaxis_rangeslider_visible=True)
+        fig.update_yaxes(title_text="Portfolio Value ($)", secondary_y=False)
+        fig.update_yaxes(title_text="Daily PnL ($)", secondary_y=True)
         
-        fig.update_layout(title='Interactive Day Trading Strategy Performance', yaxis_title='Portfolio Value ($)',
-                          xaxis_rangeslider_visible=True)
-        fig.write_html(os.path.join(self.results_dir, 'interactive_1_equity_curve.html'))
+        fig.write_html(os.path.join(self.results_dir, 'interactive_1_equity_curve_with_daily_pnl.html'))
 
     def _plot_drawdown_interactive(self):
         wealth_index = self.initial_capital * (1 + self.portfolio['returns'].fillna(0)).cumprod()
@@ -304,21 +378,37 @@ class Backtest(BaseModel):
             fig.update_yaxes(title_text="Win Rate (%)", secondary_y=True, range=[0, 100])
             fig.write_html(os.path.join(self.results_dir, 'interactive_4_day_of_month_stats.html'))
             
-    def plot(self):
+    def plot_to_file(self):
+        """Generates static plots and saves them to files."""
         if 'Message' in self.metrics:
             print("Cannot generate static plots because no trades were made.")
             return
 
         plt.style.use('seaborn-v0_8-darkgrid')
         
-        self._plot_equity_curve_static()
-        self._plot_drawdown_static()
-        self._plot_dow_stats_static()
-        self._plot_dom_stats_static()
+        self._plot_equity_curve(show_window=False)
+        self._plot_drawdown(show_window=False)
+        self._plot_dow_stats(show_window=False)
+        self._plot_dom_stats(show_window=False)
 
         print(f"\nStatic plots saved to directory: '{self.results_dir}'")
 
-    def plot_interactive(self):
+    def plot_to_window(self):
+        """Opens static plots in interactive GUI windows."""
+        if 'Message' in self.metrics:
+            print("Cannot generate plots because no trades were made.")
+            return
+
+        print("\n--- Opening Plots in Interactive Windows (close each window to continue) ---")
+        plt.style.use('seaborn-v0_8-darkgrid')
+        
+        self._plot_equity_curve(show_window=True)
+        self._plot_drawdown(show_window=True)
+        self._plot_dow_stats(show_window=True)
+        self._plot_dom_stats(show_window=True)
+
+    def plot_interactive_to_html(self):
+        """Generates interactive plots and saves them to HTML files."""
         if 'Message' in self.metrics:
             print("Cannot generate interactive plots because no trades were made.")
             return
@@ -328,6 +418,7 @@ class Backtest(BaseModel):
         self._plot_dow_stats_interactive()
         self._plot_dom_stats_interactive()
 
-        print(f"Interactive plots saved to directory: '{self.results_dir}'")
+        print(f"\nInteractive plots saved to directory: '{self.results_dir}'")
+
 
 

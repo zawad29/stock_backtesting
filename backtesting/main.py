@@ -23,11 +23,17 @@ if __name__ == '__main__':
             backtest = Backtest(data=data, strategy=rsi_strategy)
             backtest.run()
             
-            print("\n--- Generating Static Plots ---")
-            backtest.plot()
+            # --- Choose Your Plotting Method ---
+            # 1. Save static plots to files
+            print("\n--- Generating Static Plots (PNG) ---")
+            backtest.plot_to_file()
 
-            print("\n--- Generating Interactive Plots ---")
-            backtest.plot_interactive()
+            # 2. Save interactive plots to HTML files
+            print("\n--- Generating Interactive Plots (HTML) ---")
+            backtest.plot_interactive_to_html()
+
+            # 3. Open plots in new windows (uncomment the line below to use)
+            # backtest.plot_to_window()
 
         except Exception as e:
             print(f"An error occurred: {e}")

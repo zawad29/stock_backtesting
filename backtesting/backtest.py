@@ -8,6 +8,8 @@ import matplotlib.pyplot as plt
 from pydantic import BaseModel, Field
 from abc import ABC, abstractmethod
 from typing import List, Dict, Any
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 
 from strategies.strategy import Strategy
 
@@ -186,7 +188,8 @@ class Backtest(BaseModel):
             self.dom_stats.to_csv(dom_stats_path)
             print(f"Day of month stats saved to '{dom_stats_path}'")
 
-    def _plot_equity_curve(self):
+    # --- Static Plotting Methods ---
+    def _plot_equity_curve_static(self):
         fig, ax = plt.subplots(figsize=(15, 8), dpi=300)
         self.portfolio['total'].plot(ax=ax, lw=2., label='Strategy Equity Curve')
         trade_log_df = pd.DataFrame(self.trade_log).dropna()
@@ -209,7 +212,7 @@ class Backtest(BaseModel):
         fig.savefig(os.path.join(self.results_dir, '1_equity_curve.png'))
         plt.close(fig)
 
-    def _plot_drawdown(self):
+    def _plot_drawdown_static(self):
         fig, ax = plt.subplots(figsize=(15, 5), dpi=300)
         wealth_index = self.initial_capital * (1 + self.portfolio['returns'].fillna(0)).cumprod()
         previous_peaks = wealth_index.cummax()
@@ -221,7 +224,7 @@ class Backtest(BaseModel):
         fig.savefig(os.path.join(self.results_dir, '2_drawdown.png'))
         plt.close(fig)
 
-    def _plot_dow_stats(self):
+    def _plot_dow_stats_static(self):
         if not self.dow_stats.empty:
             fig, ax = plt.subplots(figsize=(10, 6), dpi=300)
             self.dow_stats['Total PnL'].plot(kind='bar', ax=ax, color='royalblue', alpha=0.7)
@@ -235,7 +238,7 @@ class Backtest(BaseModel):
             fig.savefig(os.path.join(self.results_dir, '3_day_of_week_stats.png'))
             plt.close(fig)
 
-    def _plot_dom_stats(self):
+    def _plot_dom_stats_static(self):
         if not self.dom_stats.empty:
             fig, ax = plt.subplots(figsize=(15, 6), dpi=300)
             self.dom_stats['Total PnL'].plot(kind='bar', ax=ax, color='seagreen', alpha=0.7)
@@ -249,17 +252,82 @@ class Backtest(BaseModel):
             fig.tight_layout()
             fig.savefig(os.path.join(self.results_dir, '4_day_of_month_stats.png'))
             plt.close(fig)
+
+    # --- Interactive Plotting Methods ---
+    def _plot_equity_curve_interactive(self):
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(x=self.portfolio.index, y=self.portfolio['total'], mode='lines', name='Equity Curve'))
+        
+        trade_log_df = pd.DataFrame(self.trade_log).dropna()
+        if not trade_log_df.empty:
+            long_trades = trade_log_df[trade_log_df['Type'] == 'Long']
+            short_trades = trade_log_df[trade_log_df['Type'] == 'Short']
+            
+            fig.add_trace(go.Scatter(x=long_trades['Entry Time'], y=self.portfolio.total.loc[long_trades['Entry Time']],
+                                     mode='markers', marker_symbol='triangle-up', marker_color='lime', marker_size=10, name='Long Entry'))
+            fig.add_trace(go.Scatter(x=short_trades['Entry Time'], y=self.portfolio.total.loc[short_trades['Entry Time']],
+                                     mode='markers', marker_symbol='triangle-down', marker_color='red', marker_size=10, name='Short Entry'))
+            fig.add_trace(go.Scatter(x=trade_log_df['Exit Time'], y=self.portfolio.total.loc[trade_log_df['Exit Time']],
+                                     mode='markers', marker_symbol='x', marker_color='black', marker_size=8, name='Exit'))
+        
+        fig.update_layout(title='Interactive Day Trading Strategy Performance', yaxis_title='Portfolio Value ($)',
+                          xaxis_rangeslider_visible=True)
+        fig.write_html(os.path.join(self.results_dir, 'interactive_1_equity_curve.html'))
+
+    def _plot_drawdown_interactive(self):
+        wealth_index = self.initial_capital * (1 + self.portfolio['returns'].fillna(0)).cumprod()
+        previous_peaks = wealth_index.cummax()
+        drawdowns = (wealth_index - previous_peaks) / previous_peaks
+        
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(x=drawdowns.index, y=drawdowns, fill='tozeroy', name='Drawdown', line_color='salmon'))
+        fig.update_layout(title='Interactive Portfolio Drawdown', yaxis_title='Drawdown (%)')
+        fig.write_html(os.path.join(self.results_dir, 'interactive_2_drawdown.html'))
+        
+    def _plot_dow_stats_interactive(self):
+        if not self.dow_stats.empty:
+            fig = make_subplots(specs=[[{"secondary_y": True}]])
+            fig.add_trace(go.Bar(x=self.dow_stats.index, y=self.dow_stats['Total PnL'], name='Total PnL', marker_color='royalblue'), secondary_y=False)
+            fig.add_trace(go.Scatter(x=self.dow_stats.index, y=self.dow_stats['Win Rate (%)'], name='Win Rate (%)', marker_color='orange'), secondary_y=True)
+            fig.update_layout(title_text='Interactive Performance by Day of Week')
+            fig.update_yaxes(title_text="Total PnL ($)", secondary_y=False)
+            fig.update_yaxes(title_text="Win Rate (%)", secondary_y=True, range=[0, 100])
+            fig.write_html(os.path.join(self.results_dir, 'interactive_3_day_of_week_stats.html'))
+
+    def _plot_dom_stats_interactive(self):
+        if not self.dom_stats.empty:
+            fig = make_subplots(specs=[[{"secondary_y": True}]])
+            fig.add_trace(go.Bar(x=self.dom_stats.index, y=self.dom_stats['Total PnL'], name='Total PnL', marker_color='seagreen'), secondary_y=False)
+            fig.add_trace(go.Scatter(x=self.dom_stats.index, y=self.dom_stats['Win Rate (%)'], name='Win Rate (%)', marker_color='orange'), secondary_y=True)
+            fig.update_layout(title_text='Interactive Performance by Day of Month', xaxis_title='Day of Month')
+            fig.update_yaxes(title_text="Total PnL ($)", secondary_y=False)
+            fig.update_yaxes(title_text="Win Rate (%)", secondary_y=True, range=[0, 100])
+            fig.write_html(os.path.join(self.results_dir, 'interactive_4_day_of_month_stats.html'))
             
     def plot(self):
         if 'Message' in self.metrics:
-            print("Cannot generate plot because no trades were made.")
+            print("Cannot generate static plots because no trades were made.")
             return
 
         plt.style.use('seaborn-v0_8-darkgrid')
         
-        self._plot_equity_curve()
-        self._plot_drawdown()
-        self._plot_dow_stats()
-        self._plot_dom_stats()
+        self._plot_equity_curve_static()
+        self._plot_drawdown_static()
+        self._plot_dow_stats_static()
+        self._plot_dom_stats_static()
 
-        print(f"\nPlots saved to directory: '{self.results_dir}'")
+        print(f"\nStatic plots saved to directory: '{self.results_dir}'")
+
+    def plot_interactive(self):
+        if 'Message' in self.metrics:
+            print("Cannot generate interactive plots because no trades were made.")
+            return
+        
+        self._plot_equity_curve_interactive()
+        self._plot_drawdown_interactive()
+        self._plot_dow_stats_interactive()
+        self._plot_dom_stats_interactive()
+
+        print(f"Interactive plots saved to directory: '{self.results_dir}'")
+
+

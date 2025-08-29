@@ -1,5 +1,5 @@
 
-from datetime import datetime
+from datetime import datetime, time
 import os
 import pandas as pd
 import numpy as np
@@ -21,6 +21,9 @@ class Backtest(BaseModel):
     strategy: Strategy
     initial_capital: float = Field(100000.0, gt=0)
     shares_per_trade: int = Field(100, gt=0)
+    session_start: time = Field(time(9, 30), description="Start of the trading session (e.g., 9:30 AM).")
+    session_end: time = Field(time(16, 0), description="End of the trading session (e.g., 4:00 PM).")
+
     
     # Internal state - not part of the model's public interface
     signals: pd.DataFrame = Field(default_factory=pd.DataFrame, repr=False)
@@ -55,60 +58,65 @@ class Backtest(BaseModel):
         holdings_value = 0  # Market value of current holdings
 
         for i in range(len(self.data)):
-            # --- End of Day Logic ---
-            is_end_of_day = i > 0 and self.data.index[i].date() != self.data.index[i - 1].date()
-            if is_end_of_day and position != 0:
-                # Force close position at the last price of the day
-                close_price = self.data['Close'].iloc[i - 1]
-                if position == 1:  # Close long
-                    cash += self.shares_per_trade * close_price
-                    self.trade_log[-1].update({'Exit Price': close_price, 'Exit Time': self.data.index[i - 1]})
-                elif position == -1:  # Close short
-                    cash -= self.shares_per_trade * close_price
-                    self.trade_log[-1].update({'Exit Price': close_price, 'Exit Time': self.data.index[i - 1]})
-                position = 0
-
-            # --- Trading Logic ---
-            signal = self.signals['signal'].iloc[i]
-            exit_signal = self.signals['exit_signal'].iloc[i]
+            current_timestamp = self.data.index[i]
+            current_time = current_timestamp.time()
             current_price = self.data['Close'].iloc[i]
 
-            # Handle Exits first
-            if position != 0 and exit_signal == 2:
-                if position == 1:  # Exit long
+            # --- End of Session Logic: Force close any open position at or after session end ---
+            if position != 0 and current_time >= self.session_end:
+                if position == 1:  # Close long
                     cash += self.shares_per_trade * current_price
-                    self.trade_log[-1].update({'Exit Price': current_price, 'Exit Time': self.data.index[i]})
-                    position = 0
-                elif position == -1:  # Exit short
+                    self.trade_log[-1].update({'Exit Price': current_price, 'Exit Time': current_timestamp})
+                elif position == -1:  # Close short
                     cash -= self.shares_per_trade * current_price
-                    self.trade_log[-1].update({'Exit Price': current_price, 'Exit Time': self.data.index[i]})
-                    position = 0
-            
-            # Handle Entries if flat
-            elif position == 0:
-                if signal == 1:  # Enter long
-                    position = 1
-                    cash -= self.shares_per_trade * current_price
-                    self.trade_log.append(
-                        {'Entry Time': self.data.index[i], 'Entry Price': current_price, 'Type': 'Long'})
-                elif signal == -1:  # Enter short
-                    position = -1
-                    cash += self.shares_per_trade * current_price  # Receive cash from selling borrowed shares
-                    self.trade_log.append(
-                        {'Entry Time': self.data.index[i], 'Entry Price': current_price, 'Type': 'Short'})
+                    self.trade_log[-1].update({'Exit Price': current_price, 'Exit Time': current_timestamp})
+                position = 0
+                holdings_value = 0
+                self.portfolio.loc[current_timestamp, 'total'] = cash + holdings_value
+                continue  # Move to the next bar without any further action today
 
-            # --- Update Portfolio Value ---
+            # --- Trading Logic: Only consider signals within the session ---
+            is_in_session = self.session_start <= current_time < self.session_end
+            
+            if is_in_session:
+                signal = self.signals['signal'].iloc[i]
+                exit_signal = self.signals['exit_signal'].iloc[i]
+                
+                # Handle Exits first
+                if position != 0 and exit_signal == 2:
+                    if position == 1:  # Exit long
+                        cash += self.shares_per_trade * current_price
+                        self.trade_log[-1].update({'Exit Price': current_price, 'Exit Time': current_timestamp})
+                        position = 0
+                    elif position == -1:  # Exit short
+                        cash -= self.shares_per_trade * current_price
+                        self.trade_log[-1].update({'Exit Price': current_price, 'Exit Time': current_timestamp})
+                        position = 0
+                
+                # Handle Entries if flat
+                elif position == 0:
+                    if signal == 1:  # Enter long
+                        position = 1
+                        cash -= self.shares_per_trade * current_price
+                        self.trade_log.append(
+                            {'Entry Time': current_timestamp, 'Entry Price': current_price, 'Type': 'Long'})
+                    elif signal == -1:  # Enter short
+                        position = -1
+                        cash += self.shares_per_trade * current_price  # Receive cash from selling borrowed shares
+                        self.trade_log.append(
+                            {'Entry Time': current_timestamp, 'Entry Price': current_price, 'Type': 'Short'})
+
+            # --- Update Portfolio Value for the current bar ---
             if position == 1:
                 holdings_value = self.shares_per_trade * current_price
             elif position == -1:
-                # For a short position, holdings are a liability against the cash received
                 holdings_value = -self.shares_per_trade * current_price
             else:
                 holdings_value = 0
             
-            self.portfolio.loc[self.data.index[i], 'total'] = cash + holdings_value
+            self.portfolio.loc[current_timestamp, 'total'] = cash + holdings_value
 
-        # --- Force close any open position at the end of the backtest ---
+        # --- Force close any open position at the very end of the backtest ---
         if position != 0:
             final_price = self.data['Close'].iloc[-1]
             if position == 1:
@@ -419,6 +427,5 @@ class Backtest(BaseModel):
         self._plot_dom_stats_interactive()
 
         print(f"\nInteractive plots saved to directory: '{self.results_dir}'")
-
 
 
